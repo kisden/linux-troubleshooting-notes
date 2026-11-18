@@ -20,7 +20,11 @@
 | HTTP 基线 | `curl -I http://127.0.0.1/` → **200** |
 | 端口基线 | `LISTEN 0 511 0.0.0.0:80`，Recv-Q = **0**（无积压） |
 
-基线必须先钉死再注入故障，否则后期无法区分「自己注的」和「本来就有问题」。`511` 是 nginx 编译期 `listen(2)` 的 backlog 值，`Recv-Q=0` 表示 accept 队列无积压——这两个数字在后面 4.3 节会和 python3 的 `LISTEN 0 5` 形成对照，是判断「谁在正经监听」的第二条线索。
+基线必须先钉死再注入故障，否则后期无法区分「自己注的」和「本来就有问题」。`511` 是 nginx 编译期 `listen(2)` 的 backlog 值，`Recv-Q=0` 表示 accept 队列无积压——这两个数字在后面 3.2 节会和 python3 的 `LISTEN 0 5` 形成对照，是判断「谁在正经监听」的第二条线索。
+
+![基线实拍：nginx active (running)，Main PID 712，LISTEN 0 511，curl -I 返回 HTTP/1.1 200 OK](../images/02-baseline-active-200.png)
+
+*注入任何故障之前先取这一屏：`Process:` 两行都是 `status=0/SUCCESS`，`LISTEN 0 511`，200 OK。后面所有「异常」都以此为参照。*
 
 ---
 
@@ -139,6 +143,10 @@ sudo nginx -t
 | 2 journalctl | `nginx: [emerg] unknown directive "garbage_line_here" in /etc/nginx/nginx.conf:84` | 直接定位到文件 + 行号，语法类嫌疑成立 |
 | 3 nginx -t | `nginx: configuration file /etc/nginx/nginx.conf test failed` | 语法错被**独立复现**，彻底排除端口与权限因素 |
 
+![⑤-A 实拍：Process 只有一条 14445 ExecStartPre，退出码 1/FAILURE；下方 journal 直指 nginx.conf:84 的 garbage_line_here](../images/02-status-config-error.png)
+
+*一条 `Process:` 行 + `[emerg] ... :84`，就是「配置错」的完整指纹，到这一步根因已经确定。*
+
 **关键观察**：`Process:` 行只有一条，且进程号 14445 对应的是 `ExecStartPre`。Ubuntu 的 nginx unit 里 `ExecStartPre=/usr/sbin/nginx -t -q -g 'daemon on; master_process on;'`，也就是说 master 进程还没被拉起，`nginx -t` 这一步就先挂了。这一条 `Process:` 行本身就是「配置错」的指纹。
 
 #### 根因结论
@@ -205,24 +213,27 @@ sudo ss -lntp | grep :80
 | 3 nginx -t | `syntax is ok` / `test is successful` | **语法无罪**，配置错整类被排除 |
 | 4 ss | `LISTEN 0 5 0.0.0.0:80 users:(("python3",pid=14499,fd=3))` | 定位到真正的占用者 |
 
-<!-- 待补图（png 上传至 images/ 后删除本注释标记即可）：
-![systemctl status 对比：⑤-A 只有 1 条 Process（ExecStartPre 就挂了），⑤-B 有 2 条（ExecStartPre 通过、ExecStart 失败）](../images/02-nginx-status-process-lines.png)
+![⑤-B 实拍：两条 Process —— 14517 ExecStartPre 0/SUCCESS 先通过，14518 ExecStart 才 1/FAILURE](../images/02-status-port-conflict.png)
 
-*同码不同形的硬证据：退出码都是 1/FAILURE，`Process:` 行条数是唯一区别。*
--->
+*与 3.1 的⑤-A 逐行对比：退出码完全相同，差别只在 `Process:` 的行数。看到两行，就该往端口和权限方向走。*
 
 **反直觉点一：`(98: Unknown error)` 不是权限问题。** 教程里常见的是 `(98: Address already in use)`，这里却显示 `Unknown error`。二者是同一个故障——98 就是 `errno EADDRINUSE`，只是 nginx 自带的 `strerror` 文案表里没有收录 98，回落成了 `Unknown error`。**判断时认数字不认文字**，再用 `ss` 交叉验证。
 
 **反直觉点二：5 行相同的 `bind()` 不是 5 个进程。** nginx 连续重试 5 次后才打印 `still could not bind()`，那是一个进程在重试。把它误读成「起了多个 worker 抢端口」会把排查带向完全错误的方向。
 
-<!-- 待补图（png 上传至 images/ 后删除本注释标记即可）：
-![journalctl 实拍：连续 5 行 bind() failed (98: Unknown error)，末行 still could not bind()](../images/02-nginx-errno98-bind.png)
+![journalctl 全程实拍：20:38:27 的 [emerg] unknown directive 属⑤-A，21:13:36 起连续 5 行 bind() (98: Unknown error) 属⑤-B，PID 分别是 14445 与 14518](../images/02-journal-both-faults.png)
 
-*errno 98 显示成 Unknown error，且 5 行日志出自同一进程的重试。*
--->
-
+*一屏同时躺着两个故障：上半段是配置错（PID 14445），下半段是端口冲突（PID 14518）。5 行 bind 的 PID 完全一致，证明是一个进程在重试。*
 
 **反直觉点三：`Send-Q` 的 5 与 511 不是流量指标。** `ss` 在 LISTEN 态下 `Send-Q` 是 `listen(2)` 传入的 backlog 上限：nginx 编译期是 511，python3 `http.server` 是 5。与当前连接数、流量大小无关。
+
+![ss 实拍：LISTEN 0 5 0.0.0.0:80 users:(("python3",pid=14499,fd=3))](../images/02-ss-port-owner.png)
+
+*backlog 从基线的 511 掉到 5，`users` 里的进程名也从 nginx 变成 python3 —— 两条线索同时否掉了「nginx 在监听」。*
+
+![nginx -t 实拍：syntax is ok / test is successful](../images/02-nginx-t-passed.png)
+
+*整册最关键的一屏：语法校验全绿，服务却起不来。它证明「配置错」整类已被排除，剩下的只有端口和权限。*
 
 #### 根因结论
 
@@ -295,11 +306,9 @@ sudo systemctl start nginx
 
 **踩坑说明**：只靠 `ps` 的 `COMMAND` 列判断不可靠——进程名（`prctl(PR_SET_NAME)`）和 `cmdline` 都能被改写。把 `/proc/<PID>/exe` 当作最终判据：它是内核维护的符号链接，指向真正被 `execve` 的文件，改名伪装在这里暴露无遗。
 
-<!-- 待补图（png 上传至 images/ 后删除本注释标记即可）：
-![端口溯源四步：ss 得到 PID 14569，ps 得到 root 与 21:27:20 启动，/proc/14569/exe 指向 /usr/bin/python3.10](../images/02-port-trace-chain.png)
+![端口溯源全程实拍：ss 得到 PID 14569，ps 得到 ppid 14568 / root / Tue Nov 17 21:27:20，lsof 交叉确认，/proc/14569/exe 指向 /usr/bin/python3.10](../images/02-port-trace-chain.png)
 
-*一条链拿齐四要素，最后一步是整个溯源的关键证据。*
--->
+*一条链拿齐四要素，最后一步指向 `/usr/bin/python3.10` 是整段溯源的关键证据——进程名和 cmdline 都能改，这个符号链接不能。*
 
 #### 预防措施
 
