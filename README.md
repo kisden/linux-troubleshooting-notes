@@ -1,6 +1,6 @@
 # Linux 系统与网络故障排查实训笔记
 > 基于 Ubuntu 22.04 QEMU 隔离虚拟机与 Ubuntu 24.04 VMware 虚拟机两套环境完成实操复现，记录各类运维故障的现象、排查思路、根因分析、踩坑复盘与可复用脚本。
-> 核心排障理念：**先量化，再动手；拒绝盲目试错式排错**。磁盘类故障优先用 `df -h` + `df -i` 双命令定性；服务类故障固定走「status → journalctl → 手工验证」三步法；「连不上」类故障先用客户端现象（`refused` / `timeout` / `denied`）分层，再回服务端取证据定因。
+> 核心排障理念：**先量化，再动手；拒绝盲目试错式排错**。磁盘类故障优先用 `df -h` + `df -i` 双命令定性；服务类故障固定走「status → journalctl → 手工验证」三步法；「连不上」类故障先用 `curl -v` 的断点定层（DNS / TCP / TLS / HTTP），再进层内取证。
 
 ## 📚 项目进度
 | 分册 | 主题 | 状态 |
@@ -8,7 +8,7 @@
 | 分册一 | 磁盘与文件系统类故障 | ✅ 已完成 |
 | 分册二 | systemd 服务与端口排障 | ✅ 已完成 |
 | 分册三 | 权限与认证排障 | ✅ 已完成 |
-| 分册四 | 网络分层故障排查 | 🚧 待完成 |
+| 分册四 | 网络协议排障（DNS / TCP / TLS / HTTP） | ✅ 已完成 |
 
 ### 分册一覆盖故障
 1. 磁盘容量耗尽
@@ -36,6 +36,15 @@
 
 [👉 阅读分册三：权限与认证排障笔记](./handbook/03-权限与认证排障.md)
 
+### 分册四覆盖故障
+1. DNS 解析失败（`resolv.conf` 换成静态文件，存根被摘掉）
+2. hosts 写错（`dig` 看着正常，应用却打到本机）
+3. 防火墙误拦（`DROP` 导致外部 `timeout`，本机却 200）
+4. 证书过期（自签 + 时间跳跃，两个错误叠在一起）
+5. 附：四层决策树、`dig` 与 `getent` 的路径差异、`ss` 队列语义、`tcpdump` 判据
+
+[👉 阅读分册四：网络协议排障笔记](./handbook/04-网络协议排障.md)
+
 ## 📂 仓库目录结构
 linux-troubleshooting-notes
 ├── README.md                 # 项目总览（本文件）
@@ -50,7 +59,12 @@ linux-troubleshooting-notes
 │   ├── web-403-fix.sh          # 网站 403 定向修复，全程禁用 777（分册三）
 │   ├── ssh-triage.sh           # SSH 连不上分层判定（分册三）
 │   ├── ssh-change-lifeline.sh  # 改 SSH 前的保险绳与自动回滚（分册三）
-│   └── ssh-socket-mode.sh      # socket 激活 / 常驻模式切换（分册三）
+│   ├── ssh-socket-mode.sh      # socket 激活 / 常驻模式切换（分册三）
+│   ├── net-layer-triage.sh     # 四层逐段探测，定位卡在哪一层（分册四）
+│   ├── dns-view-compare.sh     # getent / dig / dig@上游 三视角对照（分册四）
+│   ├── tls-cert-check.sh       # 证书有效期体检，按剩余天数分级（分册四）
+│   ├── port-reach-triage.sh    # 端口可达性：nc + iptables + tcpdump（分册四）
+│   └── hosts-drift-check.sh    # /etc/hosts 基线与异常条目检查（分册四）
 └── images/                   # 实验关键截图证据
 
 
@@ -58,6 +72,7 @@ linux-troubleshooting-notes
 - 分册一、二：QEMU，qcow2 镜像，Ubuntu 22.04.5 LTS，根磁盘 22G LVM，仅主机隔离网络
 - 分册三：VMware Workstation 17.6.3（VMnet8 NAT），Ubuntu 24.04.4 LTS，nginx 1.24.0 + OpenSSH 9.6p1，主机名 ubuntu24
 - 分册三多一项前置条件：支持剪贴板的图形控制台。四种 SSH 造法都会切断当前连接，必须在能直接操作虚拟机的窗口里注入。
+- 分册四：QEMU 双机，lab01（Ubuntu 22.04.5，192.168.56.12）+ attacker（Kali，192.168.56.100）。宿主机只转发 22，不转发 80，所以 Web 客户端只能用 attacker。
 
 ## 💡 核心方法论
 
@@ -88,6 +103,17 @@ linux-troubleshooting-notes
 8. **删规则按内容删，不按序号删**：`iptables -D INPUT 1` 不幂等，第二次执行必报 `Index of deletion too big`。
 9. **改 SSH 之前，保险绳要验证过再依赖**：控制台 > `at` 定时回滚 > 第二会话，可靠性就是这个顺序；`atq` 里有任务不等于它会执行。
 
+### 网络协议故障
+1. **先定层，再定因**：`curl -v` 的断点就是层的边界（`Could not resolve host` → DNS，`refused`/`timeout` → TCP，`certificate` → TLS，状态码 → HTTP）。四层里任何一层没通，都不要去看上一层的配置。
+2. **`refused` 与 `timeout` 是两种物理事实**：前者收到 RST（端口没人听），后者包被静默丢弃（防火墙/路由）。方向相反，不可互换。
+3. **本机 200 不等于对外可用**：`127.0.0.1` 走 `lo`，绕过所有外部路径；连通性必须从对端验证。
+4. **规则存在 ≠ 规则命中**：防火墙问题只认 `iptables -vnL` 的 `pkts` 增量，不认「我看规则写对了」。
+5. **`dig` 默认不是纯 DNS**：Ubuntu 上它问 `127.0.0.53` 存根，存根会合并 `/etc/hosts`；要纯 DNS 答案必须 `dig @<上游>`。
+6. **应用行为只信 `getent`**：它走 `nsswitch`，是唯一与应用程序同路径的解析方式；失败时看退出码，输出为空不代表失败。
+7. **证书问题先剥变量**：自签与过期会叠加，`--cacert <crt>` 消掉前者才能看见后者；`s_client` + `x509` 是不依赖浏览器的取证组合。
+8. **改系统时间是不可逆操作**：`timedatectl set-ntp false` 之后必须恢复并确认 `synchronized: yes`。
+9. **`sudo echo ... >> file` 不提权重定向**：`>>` 由当前 shell 执行，改用 `| sudo tee -a`。
+
 ## 📜 脚本说明
 
 ### 分册一
@@ -105,6 +131,13 @@ linux-troubleshooting-notes
 - [`ssh-triage.sh`](./scripts/ssh-triage.sh)：SSH 连不上分层判定，按 `refused`/`timeout`/`denied` 三选一路由到对应证据链（监听者身份、防火墙计数、认证策略）。
 - [`ssh-change-lifeline.sh`](./scripts/ssh-change-lifeline.sh)：改 `sshd_config` 的保险绳，备份 → 语法闸门 → `at` 定时回滚 → 重启 → 验监听，失败自动回滚。
 - [`ssh-socket-mode.sh`](./scripts/ssh-socket-mode.sh)：在 socket 激活与常驻模式之间切换，含 `/run/sshd` 补建与切换后验证；改 `Port` 前必须先切常驻。
+
+### 分册四
+- [`net-layer-triage.sh`](./scripts/net-layer-triage.sh)：给定 URL 按 DNS → TCP → TLS → HTTP 逐层探测，第一个失败层即结论；传上游 DNS 时自动做「系统解析 vs 纯 DNS」对照。
+- [`dns-view-compare.sh`](./scripts/dns-view-compare.sh)：同一域名的三视角并排输出（`getent` / 默认 `dig` / `dig @上游`），三者不一致即说明本地有覆盖，末尾自带判读规则。
+- [`tls-cert-check.sh`](./scripts/tls-cert-check.sh)：`s_client` + `x509` 取证书并算剩余天数，退出码分级（0 正常 / 1 临期 / 2 过期或未生效 / 3 取不到），可直接接监控。
+- [`port-reach-triage.sh`](./scripts/port-reach-triage.sh)：端口可达性三件套，`nc` 判 `refused`/`timeout`、`iptables` 看计数、`tcpdump` 看有无 SYN-ACK，并给出路由出口。
+- [`hosts-drift-check.sh`](./scripts/hosts-drift-check.sh)：`/etc/hosts` 指纹基线比对 + 异常条目识别（公网域名指向回环/内网），对应分册四的 hosts 劫持场景。
 
 使用方式（统一以仓库根目录为工作目录）：
 ```bash
@@ -143,4 +176,20 @@ sudo ./scripts/ssh-change-lifeline.sh apply
 # 分册三：切常驻模式后 Port 才生效
 sudo ./scripts/ssh-socket-mode.sh status
 sudo ./scripts/ssh-socket-mode.sh standalone
+
+# 分册四：一条命令定位「打不开」卡在哪一层（第二个参数是上游 DNS，用于对照）
+./scripts/net-layer-triage.sh https://127.0.0.1/ 10.0.2.3
+
+# 分册四：解析三视角对照（getent / dig / dig @上游）
+./scripts/dns-view-compare.sh www.ubuntu.com 10.0.2.3
+
+# 分册四：证书剩余天数体检（退出码 0/1/2/3 可接监控）
+./scripts/tls-cert-check.sh 127.0.0.1 443 30
+
+# 分册四：端口可达性分层判定（在目标机上执行）
+sudo ./scripts/port-reach-triage.sh 192.168.56.12 80 ens4
+
+# 分册四：/etc/hosts 基线比对（首次运行会给出保存基线的命令）
+./scripts/hosts-drift-check.sh
+./scripts/hosts-drift-check.sh /var/lib/baseline/hosts.sha256
 ```
