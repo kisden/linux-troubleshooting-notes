@@ -64,6 +64,9 @@
 ```
 linux-troubleshooting-notes
 ├── README.md                 # 项目总览（本文件）
+├── LICENSE                   # MIT 许可协议
+├── .gitattributes            # 固定 LF 换行，防止 .sh 在 Linux 报 bad interpreter
+├── .gitignore                # 排除编辑器缓存、脚本运行产物与文档原稿
 ├── handbook/                 # 各分册学习笔记
 ├── scripts/                  # 可复用排障、巡检脚本
 │   ├── baseline-check.sh       # 系统基线采集比对脚本（分册一）
@@ -265,3 +268,9 @@ sudo ./scripts/resource-baseline-check.sh
 ./scripts/resource-baseline-check.sh --save /var/lib/baseline/mt.json
 ./scripts/resource-baseline-check.sh --diff /var/lib/baseline/mt.json
 ```
+
+## 📄 许可
+
+本仓库采用 [MIT License](./LICENSE) 发布：笔记与脚本可自由用于学习、教学与生产排障，保留版权声明即可；因直接照搬脚本产生的任何后果，作者不承担责任——排障命令请先在隔离环境验证。
+
+仓库内所有命令、输出与截图均来自本人实验环境实测，不含任何真实生产系统地址、账号或凭据。
