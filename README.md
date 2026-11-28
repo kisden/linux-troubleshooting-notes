@@ -2,6 +2,7 @@
 
 > 基于 Ubuntu 22.04 QEMU 隔离虚拟机与 Ubuntu 24.04 VMware 虚拟机两套环境完成实操复现，记录各类运维故障的现象、排查思路、根因分析、踩坑复盘与可复用脚本。
 > 核心排障理念：**先量化，再动手；拒绝盲目试错式排错**。磁盘类故障优先用 `df -h` + `df -i` 双命令定性；服务类故障固定走「status → journalctl → 手工验证」三步法；「连不上」类故障先用 `curl -v` 的断点定层（DNS / TCP / TLS / HTTP），再进层内取证；「系统活着但服务消失」类故障先看退出码（137/143），再下到内核日志（`dmesg`）与 `/proc` 取证。
+> 分册六另加一层验收：自建故障注入器 + 限时盲盒，不看答案排障，用**首次假设命中率**与**定位层级**衡量能力，而不是「修好了几个」。
 
 ## 📚 项目进度
 
@@ -12,6 +13,7 @@
 | 分册三 | 权限与认证排障 | ✅ 已完成 |
 | 分册四 | 网络协议排障（DNS / TCP / TLS / HTTP） | ✅ 已完成 |
 | 分册五 | 资源与调度排障（OOM / 时间同步） | ✅ 已完成 |
+| 分册六 | 盲盒对抗与复盘（自建注入器 · 6 类题库） | ✅ 已完成 |
 
 ### 分册一覆盖故障
 
@@ -59,6 +61,15 @@
 
 [👉 阅读分册五：资源与调度排障笔记](./handbook/05-资源与调度排障.md)
 
+### 分册六覆盖内容
+
+1. 自建故障注入器 `chaos.sh`：6 类题库（`log_flood` / `port_busy` / `perm_denied` / `ssh_down` / `dns_bad` / `hosts_wrong`），每类带注入自检，自检失败自动回退
+2. 第一轮盲盒：`--inject 1` → `log_flood`，五条命令覆盖磁盘 / 端口 / 权限三族，**缺容量族，0 命中**，20 分钟封顶；对答案后 `du -sh` 显示 `syslog` 已 501 MB
+3. 第二轮盲盒：`hosts_wrong`，`getent` 返回 `127.0.0.1` 定性，`cat /etc/hosts` 看到末尾追加行，**2 条命令定位**
+4. 附：三个训练指标（命中率 / 平均定位耗时 / 定位层级）、注入器自检失效的三种形态、渐变型故障的间隔采样判据、盲盒前后 6 维巡检
+
+[👉 阅读分册六：盲盒对抗与复盘笔记](./handbook/06-盲盒对抗与复盘.md)
+
 ## 📂 仓库目录结构
 
 ```
@@ -88,7 +99,10 @@ linux-troubleshooting-notes
 │   ├── mem-safe-run.sh         # cgroup 限额运行 + 自动取证（分册五）
 │   ├── time-drift-triage.sh    # 时间漂移分层诊断（分册五）
 │   ├── time-sync-restore.sh    # 时间同步恢复标准流程（分册五）
-│   └── resource-baseline-check.sh # 内存 + 时间双维度巡检（分册五）
+│   ├── resource-baseline-check.sh # 内存 + 时间双维度巡检（分册五）
+│   ├── chaos.sh                # 盲盒故障注入器，6 类题库 + 自检 + 对称恢复（分册六）
+│   ├── blindbox-audit.sh       # 盲盒前后 6 维健康巡检（分册六）
+│   └── blindbox-score.sh       # 盲盒记录表 → 四个训练指标（分册六）
 └── images/                   # 实验关键截图证据
 ```
 
@@ -99,6 +113,7 @@ linux-troubleshooting-notes
 - 分册三多一项前置条件：支持剪贴板的图形控制台。四种 SSH 造法都会切断当前连接，必须在能直接操作虚拟机的窗口里注入。
 - 分册四：QEMU 双机，lab01（Ubuntu 22.04.5，192.168.56.12）+ attacker（Kali，192.168.56.100）。宿主机只转发 22，不转发 80，所以 Web 客户端只能用 attacker。
 - 分册五：回到 lab01（Ubuntu 22.04.5，**2048 MB**，swap 1.8 Gi）。做 OOM 实验前必须关掉宿主机上的 Edge / Steam / WPS——虚拟机内存被挤占时 OOM 现象会失真。
+- 分册六：回到 ubuntu24（Ubuntu 24.04.4 LTS，VMware 17.6.3，VMnet8 NAT，`192.168.153.128/24`，网卡 `ens33`，DHCP）。**注入必须在 VMware 控制台窗口执行**：`ssh_down` 会切断当前 SSH 会话，命令还没返回连接就断了，连「注入成功没有」都验不了。
 
 ## 💡 核心方法论
 
@@ -157,6 +172,16 @@ linux-troubleshooting-notes
 10. **时间是每个进程各自读的**：系统时钟改了，已在运行的进程可能还持有旧的时间认知。恢复后要复核 `/var/log/syslog` 的 `mtime` 是否跟随。
 11. **时钟回跳后 `journalctl -n` 拿到的是「时间最大」而非「最新写入」**：新日志被标成旧时间会沉到最前。用 `--since/--until` 按时间窗口捞。
 
+### 盲盒对抗与复盘
+1. **排障的难点是「方向」，不是「命令」**：命令可以查手册，方向只能从现象里长出来。首轮失手的 `log_flood`，`df`/`du`/`ss` 一条没少敲，缺的是「容量」这一整族假设。
+2. **渐变型故障的单次采样永远正常**：它就是从正常值开始涨的。判据必须换成两次采样求差 + `du -sh /var/log/* | sort -h | tail -3` 点名。
+3. **注入器没有自检，等于没有题库**：自检失败要自动回退；自检锚点要选「服务视角的事实」（`curl` 的 403 比 `test -r` 稳，`ss` 的监听表比 `systemctl` 返回码稳）。
+4. **恢复必须与注入对称**：`do_inject` / `verify_one` / `do_restore` 三段分离，改一段就数一遍分支；少一项，下一轮现象叠加。
+5. **读操作与写操作不能共用代码路径**：`--status` 复用注入函数会二次注入（`hosts_wrong` 再追加一行、`log_flood` 再写 500 MB）。
+6. **前置条件不满足时宁可不注入**：断网机器上注入 `dns_bad`，自检恒真，制造假阳性。
+7. **解释力不等于正确性**：「每分钟备份任务在写盘」能解释任何缓慢增长，但 `crontab -l` 一查，它 22:00 才跑。
+8. **指标比形容词可信**：命中率、定位层级、误判次数，三个数字就能说清一轮训练的质量。
+
 ## 📜 脚本说明
 
 ### 分册一
@@ -192,6 +217,12 @@ linux-troubleshooting-notes
 - [`time-drift-triage.sh`](./scripts/time-drift-triage.sh)：时间漂移五层诊断（RTC / 系统时钟 / 同步服务 / 时间源 / 偏差量），专治 `506` 误判与「RTC 存 UTC 被当本地时间」。
 - [`time-sync-restore.sh`](./scripts/time-sync-restore.sh)：时间恢复的标准流程（交回 NTP → 服务真的起来 → `makestep` 跳变 → 三处验证），含 `--dry-run` 预演与 NTP 不可达时的 `--force-set`。
 - [`resource-baseline-check.sh`](./scripts/resource-baseline-check.sh)：内存 + 时间双维度巡检，含 swap、`si/so` 换页、OOM 分类计数、未设限额服务数、时间源数量，支持基线保存与比对，退出码可接监控。
+
+### 分册六
+
+- [`chaos.sh`](./scripts/chaos.sh)：盲盒故障注入器，6 类题库（日志暴涨 / 端口占用 / 权限收紧 / SSH 停止 / 上游 DNS 不可达 / hosts 劫持）。每类带注入自检，验不过自动回退；`--inject` 洗牌不重复抽取，`--status` 只读不二次注入，`--restore` 与注入严格对称。
+- [`blindbox-audit.sh`](./scripts/blindbox-audit.sh)：盲盒前后 6 维巡检（容量 / 端口 / 站点 / 解析 / 时间 / 调度），把注入器的自检条件反写成健康判据，退出码 0/1/2 可直接接监控。
+- [`blindbox-score.sh`](./scripts/blindbox-score.sh)：把盲盒记录 CSV 按轮聚合成四个指标（命中率 / 平均耗时 / 平均定位层级 / 误判次数），按「命中率 ≥ 50%」判定是否具备独立排障能力。
 
 使用方式（统一以仓库根目录为工作目录）：
 
@@ -267,6 +298,22 @@ sudo ./scripts/time-sync-restore.sh
 sudo ./scripts/resource-baseline-check.sh
 ./scripts/resource-baseline-check.sh --save /var/lib/baseline/mt.json
 ./scripts/resource-baseline-check.sh --diff /var/lib/baseline/mt.json
+
+# 分册六：开盲盒前巡检（0 干净 / 1 WARN / 2 FAIL）
+./scripts/blindbox-audit.sh
+
+# 分册六：注入 1 个故障（必须在控制台执行，不要在 SSH 会话里）
+sudo ./scripts/chaos.sh --inject 1
+sudo ./scripts/chaos.sh --status
+
+# 分册六：对答案 + 恢复 + 复核
+sudo ./scripts/chaos.sh --answer
+sudo ./scripts/chaos.sh --restore
+./scripts/blindbox-audit.sh
+
+# 分册六：把记录表算成指标
+./scripts/blindbox-score.sh --template > record.csv
+./scripts/blindbox-score.sh record.csv
 ```
 
 ## 📄 许可
